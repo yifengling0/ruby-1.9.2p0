@@ -36,14 +36,29 @@
 #ifdef __MINGW32__
 #include <mswsock.h>
 #endif
+
+
 #include "ruby/win32.h"
+
 #include "win32/dir.h"
 #define isdirsep(x) ((x) == '/' || (x) == '\\')
+
+
+// #undef _stat       
+// #undef _stati64    
 
 #undef stat
 #undef fclose
 #undef close
 #undef setsockopt
+
+
+//#include <sys/stat.h>
+
+//#define stati64 _stat64
+//#define _stati64 _stati64
+
+
 
 #if defined __BORLANDC__
 #  define _filbuf _fgetc
@@ -643,18 +658,20 @@ StartSockets(void)
     NtSocketsInitialized = 1;
 }
 
+static void
+set_pioinfo_extra(void);
 //
 // Initialization stuff
 //
 void
 rb_w32_sysinit(int *argc, char ***argv)
 {
-#if RT_VER >= 80
+#if RT_VER >= 60
     static void set_pioinfo_extra(void);
 
-    _CrtSetReportMode(_CRT_ASSERT, 0);
-    _set_invalid_parameter_handler(invalid_parameter);
-    _RTC_SetErrorFunc(rtc_error_handler);
+     _CrtSetReportMode(_CRT_ASSERT, 0);
+     _set_invalid_parameter_handler(invalid_parameter);
+     _RTC_SetErrorFunc(rtc_error_handler);
     set_pioinfo_extra();
 #endif
 
@@ -1968,19 +1985,35 @@ rb_w32_closedir(DIR *dirp)
 # define STHREAD_ONLY(x) x
 #endif
 
-typedef struct	{
-    intptr_t osfhnd;	/* underlying OS file HANDLE */
-    char osfile;	/* attributes of file (e.g., open in text mode?) */
-    char pipech;	/* one char buffer for handles opened on pipes */
-#ifdef MSVCRT_THREADS
-    int lockinitflag;
-    CRITICAL_SECTION lock;
-#endif
-#if RT_VER >= 80
-    char textmode;
-    char pipech2[2];
-#endif
-}	ioinfo;
+typedef char lowio_text_mode;
+typedef char lowio_pipe_lookahead[3];
+
+// typedef struct	{
+//     intptr_t osfhnd;	/* underlying OS file HANDLE */
+//     char osfile;	/* attributes of file (e.g., open in text mode?) */
+//     char pipech;	/* one char buffer for handles opened on pipes */
+//     int lockinitflag;
+//     CRITICAL_SECTION lock;
+// #if RUBY_MSVCRT_VERSION >= 80
+//     char textmode;
+//     char pipech2[2];
+// #endif
+// }	ioinfo;
+//#endif
+
+typedef struct {
+    CRITICAL_SECTION           lock;
+    intptr_t                   osfhnd;          // underlying OS file HANDLE
+    __int64                    startpos;        // File position that matches buffer start
+    unsigned char              osfile;          // Attributes of file (e.g., open in text mode?)
+    lowio_text_mode            textmode;
+    lowio_pipe_lookahead       _pipe_lookahead;
+
+    uint8_t unicode          : 1; // Was the file opened as unicode?
+    uint8_t utf8translations : 1; // Buffer contains translations other than CRLF
+    uint8_t dbcsBufferUsed   : 1; // Is the dbcsBuffer in use?
+    char    dbcsBuffer;           // Buffer for the lead byte of DBCS when converting from DBCS to Unicode
+} ioinfo;
 
 #if !defined _CRTIMP || defined __MINGW32__
 #undef _CRTIMP
@@ -1988,21 +2021,125 @@ typedef struct	{
 #endif
 
 #if !defined(__BORLANDC__)
+#if _MSC_VER >= 1400
+static ioinfo ** __pioinfo = NULL;
+#define IOINFO_L2E 6
+#else
 EXTERN_C _CRTIMP ioinfo * __pioinfo[];
+#define IOINFO_L2E 5
+#endif
+//EXTERN_C _CRTIMP ioinfo * __pioinfo[];
 
-#define IOINFO_L2E			5
+//#define IOINFO_L2E			5
 #define IOINFO_ARRAY_ELTS	(1 << IOINFO_L2E)
-#define _pioinfo(i)	((ioinfo*)((char*)(__pioinfo[i >> IOINFO_L2E]) + (i & (IOINFO_ARRAY_ELTS - 1)) * (sizeof(ioinfo) + pioinfo_extra)))
+//#define _pioinfo(i)	((ioinfo*)((char*)(__pioinfo[i >> IOINFO_L2E]) + (i & (IOINFO_ARRAY_ELTS - 1)) * (sizeof(ioinfo) + pioinfo_extra)))
 #define _osfhnd(i)  (_pioinfo(i)->osfhnd)
 #define _osfile(i)  (_pioinfo(i)->osfile)
 #define _pipech(i)  (_pioinfo(i)->pipech)
 
-#if RT_VER >= 80
+
 static size_t pioinfo_extra = 0;	/* workaround for VC++8 SP1 */
 
+static inline ioinfo* _pioinfo(int fd)
+{
+    const size_t sizeof_ioinfo = sizeof(ioinfo) + pioinfo_extra;
+    return (ioinfo*)((char*)__pioinfo[fd >> IOINFO_L2E] +
+		     (fd & (IOINFO_ARRAY_ELTS - 1)) * sizeof_ioinfo);
+}
+
+#if RT_VER >= 60
+/* License: Ruby's */
+static FARPROC
+get_proc_address(const char *module, const char *func, HANDLE *mh)
+{
+    HANDLE h;
+    FARPROC ptr;
+
+    if (mh)
+	h = LoadLibrary(module);
+    else
+	h = GetModuleHandle(module);
+    if (!h)
+	return NULL;
+
+    ptr = GetProcAddress(h, func);
+    if (mh) {
+	if (ptr)
+	    *mh = h;
+	else
+	    FreeLibrary(h);
+    }
+    return ptr;
+}
+
+
+
+/* License: Ruby's */
 static void
 set_pioinfo_extra(void)
 {
+# define FUNCTION_RET 0xc3 /* ret */
+// # ifdef _DEBUG
+// #  define UCRTBASE "ucrtbased.dll"
+// # else
+// #  define UCRTBASE "ucrtbase.dll"
+// # endif
+    /* get __pioinfo addr with _isatty */
+    char *p = (char*)get_proc_address("ucrtbase.dll", "_isatty", NULL);
+    char *pend = p;
+    /* _osfile(fh) & FDEV */
+
+# if _WIN64
+    int32_t rel;
+    char *rip;
+    /* add rsp, _ */
+#  define FUNCTION_BEFORE_RET_MARK "\x48\x83\xc4"
+#  define FUNCTION_SKIP_BYTES 1
+#  ifdef _DEBUG
+    /* lea rcx,[__pioinfo's addr in RIP-relative 32bit addr] */
+#   define PIOINFO_MARK "\x48\x8d\x0d"
+#  else
+    /* lea rdx,[__pioinfo's addr in RIP-relative 32bit addr] */
+#   define PIOINFO_MARK "\x48\x8d\x15"
+#  endif
+
+# else /* x86 */
+    /* pop ebp */
+#  define FUNCTION_BEFORE_RET_MARK "\x5d"
+#  define FUNCTION_SKIP_BYTES 0
+    /* mov eax,dword ptr [eax*4+100EB430h] */
+#  define PIOINFO_MARK "\x8B\x04\x85"
+# endif
+    if (p) {
+        for (pend += 10; pend < p + 300; pend++) {
+            // find end of function
+            if (memcmp(pend, FUNCTION_BEFORE_RET_MARK, sizeof(FUNCTION_BEFORE_RET_MARK) - 1) == 0 &&
+                *(pend + (sizeof(FUNCTION_BEFORE_RET_MARK) - 1) + FUNCTION_SKIP_BYTES) & FUNCTION_RET == FUNCTION_RET) {
+                // search backwards from end of function
+                for (pend -= (sizeof(PIOINFO_MARK) - 1); pend > p; pend--) {
+                    if (memcmp(pend, PIOINFO_MARK, sizeof(PIOINFO_MARK) - 1) == 0) {
+                        p = pend;
+                        goto found;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    fprintf(stderr, "unexpected " "urtbase" "\n");
+    _exit(1);
+
+    found:
+    p += sizeof(PIOINFO_MARK) - 1;
+#if _WIN64
+    rel = *(int32_t*)(p);
+    rip = p + sizeof(int32_t);
+    __pioinfo = (ioinfo**)(rip + rel);
+#else
+    __pioinfo = *(ioinfo***)(p);
+#endif
+#endif
+
     int fd;
 
     fd = _open("NUL", O_RDONLY);
@@ -2018,9 +2155,6 @@ set_pioinfo_extra(void)
 	pioinfo_extra = 0;
     }
 }
-#else
-#define pioinfo_extra 0
-#endif
 
 #define _set_osfhnd(fh, osfh) (void)(_osfhnd(fh) = osfh)
 #define _set_osflags(fh, flags) (_osfile(fh) = (flags))
@@ -2032,6 +2166,8 @@ set_pioinfo_extra(void)
 #define FAPPEND			0x20	/* file handle opened O_APPEND */
 #define FDEV			0x40	/* file handle refers to device */
 #define FTEXT			0x80	/* file handle is in text mode */
+
+
 
 static int
 rb_w32_open_osfhandle(intptr_t osfhandle, int flags)
@@ -2074,42 +2210,42 @@ rb_w32_open_osfhandle(intptr_t osfhandle, int flags)
     return fh;			/* return handle */
 }
 
-static void
-init_stdhandle(void)
-{
-    int nullfd = -1;
-    int keep = 0;
-#define open_null(fd)						\
-    (((nullfd < 0) ?						\
-      (nullfd = open("NUL", O_RDWR|O_BINARY)) : 0),		\
-     ((nullfd == (fd)) ? (keep = 1) : dup2(nullfd, fd)),	\
-     (fd))
+// static void
+// init_stdhandle(void)
+// {
+//     int nullfd = -1;
+//     int keep = 0;
+// #define open_null(fd)						\
+//     (((nullfd < 0) ?						\
+//       (nullfd = open("NUL", O_RDWR|O_BINARY)) : 0),		\
+//      ((nullfd == (fd)) ? (keep = 1) : dup2(nullfd, fd)),	\
+//      (fd))
 
-    if (fileno(stdin) < 0) {
-	stdin->_file = open_null(0);
-    }
-    else {
-	setmode(fileno(stdin), O_BINARY);
-    }
-    if (fileno(stdout) < 0) {
-	stdout->_file = open_null(1);
-    }
-    else {
-	setmode(fileno(stdout), O_BINARY);
-    }
-    if (fileno(stderr) < 0) {
-	stderr->_file = open_null(2);
-    }
-    else {
-	setmode(fileno(stderr), O_BINARY);
-    }
-    if (nullfd >= 0 && !keep) close(nullfd);
-    setvbuf(stderr, NULL, _IONBF, 0);
-}
-#else
+//     if (fileno(stdin) < 0) {
+// 	stdin->_file = open_null(0);
+//     }
+//     else {
+// 	setmode(fileno(stdin), O_BINARY);
+//     }
+//     if (fileno(stdout) < 0) {
+// 	stdout->_file = open_null(1);
+//     }
+//     else {
+// 	setmode(fileno(stdout), O_BINARY);
+//     }
+//     if (fileno(stderr) < 0) {
+// 	stderr->_file = open_null(2);
+//     }
+//     else {
+// 	setmode(fileno(stderr), O_BINARY);
+//     }
+//     if (nullfd >= 0 && !keep) close(nullfd);
+//     setvbuf(stderr, NULL, _IONBF, 0);
+// }
+// #else
 
-#define _set_osfhnd(fh, osfh) (void)((fh), (osfh))
-#define _set_osflags(fh, flags) (void)((fh), (flags))
+// #define _set_osfhnd(fh, osfh) (void)((fh), (osfh))
+// #define _set_osflags(fh, flags) (void)((fh), (flags))
 
 static void
 init_stdhandle(void)
@@ -4113,6 +4249,7 @@ check_valid_dir(const WCHAR *path)
     return 0;
 }
 
+
 static int
 winnt_stat(const WCHAR *path, struct stati64 *st)
 {
@@ -4475,36 +4612,39 @@ read(int fd, void *buf, size_t size)
 int
 rb_w32_getc(FILE* stream)
 {
-    int c;
-    if (enough_to_get(stream->FILE_COUNT)) {
-	c = (unsigned char)*stream->FILE_READPTR++;
-    }
-    else 
-    {
-	c = _filbuf(stream);
-#if defined __BORLANDC__
-        if ((c == EOF) && (errno == EPIPE)) {
-	    clearerr(stream);
-        }
-#endif
-	catch_interrupt();
-    }
-    return c;
+//     int c;
+//     if (enough_to_get(stream->FILE_COUNT)) {
+// 	c = (unsigned char)*stream->FILE_READPTR++;
+//     }
+//     else 
+//     {
+// 	c = _filbuf(stream);
+// #if defined __BORLANDC__
+//         if ((c == EOF) && (errno == EPIPE)) {
+// 	    clearerr(stream);
+//         }
+// #endif
+// 	catch_interrupt();
+//     }
+//     return c;
+//fprintf(stderr, "couldn't get rb_w32_getc\n");
+return fgetc(stream);
 }
 
 #undef fputc
 int
 rb_w32_putc(int c, FILE* stream)
 {
-    if (enough_to_put(stream->FILE_COUNT)) {
-	c = (unsigned char)(*stream->FILE_READPTR++ = (char)c);
-    }
-    else 
-    {
-	c = _flsbuf(c, stream);
-	catch_interrupt();
-    }
-    return c;
+    // if (enough_to_put(stream->FILE_COUNT)) {
+	// c = (unsigned char)(*stream->FILE_READPTR++ = (char)c);
+    // }
+    // else 
+    // {
+	// c = _flsbuf(c, stream);
+	// catch_interrupt();
+    // }
+    // return c;
+	return fputc(c, stream);
 }
 
 struct asynchronous_arg_t {
@@ -4682,6 +4822,11 @@ rb_w32_getppid(void)
     return ppid;
 }
 
+
+
+int
+rb_w32_wopen(const WCHAR *file, int oflag, int pmode);
+
 int
 rb_w32_uopen(const char *file, int oflag, ...)
 {
@@ -4701,6 +4846,7 @@ rb_w32_uopen(const char *file, int oflag, ...)
     return ret;
 }
 
+/* License: Ruby's */
 int
 rb_w32_open(const char *file, int oflag, ...)
 {
@@ -4713,18 +4859,35 @@ rb_w32_open(const char *file, int oflag, ...)
     pmode = va_arg(arg, int);
     va_end(arg);
 
-    if ((oflag & O_TEXT) || !(oflag & O_BINARY))
-	return _open(file, oflag, pmode);
-
     if (!(wfile = filecp_to_wstr(file, NULL)))
 	return -1;
-    ret = rb_w32_wopen(wfile, oflag, pmode);
+    ret = w32_wopen(wfile, oflag, pmode);
     free(wfile);
     return ret;
 }
 
+
+/* License: Ruby's */
 int
 rb_w32_wopen(const WCHAR *file, int oflag, ...)
+{
+    int pmode = 0;
+
+    if (oflag & O_CREAT) {
+	va_list arg;
+	va_start(arg, oflag);
+	pmode = va_arg(arg, int);
+	va_end(arg);
+    }
+
+    return w32_wopen(file, oflag, pmode);
+}
+
+static int result = 0;
+static int oflag_r = 0;
+
+int
+w32_wopen(const WCHAR *file, int oflag, int pmode)
 {
     char flags = 0;
     int fd;
@@ -4734,14 +4897,17 @@ rb_w32_wopen(const WCHAR *file, int oflag, ...)
     SECURITY_ATTRIBUTES sec;
     HANDLE h;
 
-    if ((oflag & O_TEXT) || !(oflag & O_BINARY)) {
-	va_list arg;
-	int pmode;
-	va_start(arg, oflag);
-	pmode = va_arg(arg, int);
-	va_end(arg);
-	return _wopen(file, oflag, pmode);
-    }
+	oflag_r = oflag;
+
+    // if ((oflag & O_TEXT) || !(oflag & O_BINARY)) {
+	// // va_list arg;
+	// // int pmode;
+	// // va_start(arg, oflag);
+	// // pmode = va_arg(arg, int);
+	// // va_end(arg);
+	// result = _wopen(file, oflag, 0);
+	// return result;
+    // }
 
     sec.nLength = sizeof(sec);
     sec.lpSecurityDescriptor = NULL;

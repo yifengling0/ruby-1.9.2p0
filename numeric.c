@@ -78,7 +78,7 @@ const unsigned char rb_nan[] = "\x7f\xc0\x00\x00";
 #endif
 
 extern double round(double);
-
+/*
 #ifndef HAVE_ROUND
 double
 round(double x)
@@ -96,6 +96,7 @@ round(double x)
     return x;
 }
 #endif
+*/
 
 static ID id_coerce, id_to_i, id_eq;
 

@@ -120,6 +120,8 @@ dln_find_file(const char *fname, const char *path)
     return dln_find_file_r(fname, path, fbuf, sizeof(fbuf));
 }
 
+#undef stat
+
 static char *
 dln_find_1(const char *fname, const char *path, char *fbuf, size_t size,
 	   int exe_flag /* non 0 if looking for executable. */)

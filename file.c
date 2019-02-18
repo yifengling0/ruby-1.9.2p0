@@ -24,6 +24,8 @@
 #include "ruby/util.h"
 #include "dln.h"
 
+#undef stat
+
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif

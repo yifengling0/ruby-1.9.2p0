@@ -1272,6 +1272,10 @@ glob_func_caller(VALUE val)
 
 #define glob_call_func(func, path, arg, enc) (*func)(path, arg, enc)
 
+#undef stat
+#undef stati64
+#undef _stati64
+
 static int
 glob_helper(
     const char *path,

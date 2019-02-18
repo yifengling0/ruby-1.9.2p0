@@ -17,6 +17,8 @@
 #include <ctype.h>
 #include <errno.h>
 
+#undef stat
+
 #define free(x) xfree(x)
 
 #if defined(DOSISH) || defined(__CYGWIN__)
@@ -485,9 +487,9 @@ rb_io_read_pending(rb_io_t *fptr)
 void
 rb_read_check(FILE *fp)
 {
-    if (!STDIO_READ_DATA_PENDING(fp)) {
-	rb_thread_wait_fd(fileno(fp));
-    }
+    // if (!STDIO_READ_DATA_PENDING(fp)) {
+	// rb_thread_wait_fd(fileno(fp));
+    // }
 }
 
 void
